@@ -1,6 +1,7 @@
 import { convertCurrency } from './fx';
 
 export const CURRENCIES = ['USD', 'EUR', 'GBP', 'HKD', 'CAD', 'AUD', 'CHF', 'SEK', 'NOK', 'DKK', 'MXN', 'ILS', 'JPY', 'PHP'];
+export const PERIODS = ['one_time', 'daily', 'weekly', 'monthly', 'yearly'];
 
 export function num(value, fallback = 0) {
   const parsed = Number(value);
@@ -19,13 +20,20 @@ export function fmt(value, currency = 'USD') {
   }).format(num(value));
 }
 
-export function daysUntil(dateString) {
-  if (!dateString) return null;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const due = new Date(`${dateString}T00:00:00`);
-  if (Number.isNaN(due.getTime())) return null;
-  return Math.ceil((due - today) / 86400000);
+export function todayPlus(days) {
+  const date = new Date();
+  date.setDate(date.getDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+export function periodAmount(amount, period, days) {
+  const value = num(amount);
+  const d = num(days, 7);
+  if (period === 'daily') return value * d;
+  if (period === 'weekly') return value * (d / 7);
+  if (period === 'monthly') return value * (d / 30);
+  if (period === 'yearly') return value * (d / 365);
+  return value;
 }
 
 export async function enrichPayout(payout, displayCurrency) {
@@ -36,90 +44,117 @@ export async function enrichPayout(payout, displayCurrency) {
   const bankReceivingFeeNative = num(payout.bank_receiving_fee_flat);
   const totalFeesNative = payoutConversionFeeNative + payoutTransferFeeNative + bankConversionFeeNative + bankReceivingFeeNative;
   const netNative = Math.max(0, grossNative - totalFeesNative);
-  const netDisplay = await convertCurrency(netNative, payout.currency, displayCurrency);
-  const grossDisplay = await convertCurrency(grossNative, payout.currency, displayCurrency);
-  const totalFeesDisplay = await convertCurrency(totalFeesNative, payout.currency, displayCurrency);
 
   return {
     ...payout,
     grossNative,
-    payoutConversionFeeNative,
-    payoutTransferFeeNative,
-    bankConversionFeeNative,
-    bankReceivingFeeNative,
     totalFeesNative,
     netNative,
-    grossDisplay,
-    totalFeesDisplay,
-    netDisplay
+    grossDisplay: await convertCurrency(grossNative, payout.currency, displayCurrency),
+    totalFeesDisplay: await convertCurrency(totalFeesNative, payout.currency, displayCurrency),
+    netDisplay: await convertCurrency(netNative, payout.currency, displayCurrency)
   };
 }
 
-export async function calculateDashboard({ banks, payouts, suppliers, adAccounts, settings }) {
+export async function calculateDashboard({ banks, payouts, suppliers, adAccounts, opexItems, settings }) {
   const displayCurrency = settings.display_currency || 'USD';
+  const cashflowDays = num(settings.cashflow_days, 7);
+  const scalePercent = num(settings.scale_percent, 20);
+  const roasThreshold = num(settings.roas_threshold, 1.8);
+  const ownerDrawTargetDisplay = await convertCurrency(num(settings.owner_draw_target), settings.owner_draw_currency || displayCurrency, displayCurrency);
+
   const enrichedPayouts = [];
+  for (const payout of payouts) enrichedPayouts.push(await enrichPayout(payout, displayCurrency));
 
-  for (const payout of payouts) {
-    enrichedPayouts.push(await enrichPayout(payout, displayCurrency));
-  }
-
-  const bankCards = [];
+  const bankRows = [];
   for (const bank of banks) {
     const balanceDisplay = await convertCurrency(num(bank.balance), bank.currency, displayCurrency);
-    const routedIncoming = enrichedPayouts.filter(p => p.destination_bank_id === bank.id && p.status !== 'received');
-    const incomingDisplay = routedIncoming.reduce((sum, p) => sum + p.netDisplay, 0);
-    bankCards.push({ ...bank, balanceDisplay, incomingDisplay, projectedDisplay: balanceDisplay + incomingDisplay });
+    const incomingDisplay = enrichedPayouts
+      .filter(p => p.destination_bank_id === bank.id && p.status !== 'received')
+      .reduce((sum, p) => sum + p.netDisplay, 0);
+    bankRows.push({ ...bank, balanceDisplay, incomingDisplay, projectedDisplay: balanceDisplay + incomingDisplay });
   }
 
   const supplierRows = [];
   for (const supplier of suppliers) {
-    const amountDisplay = await convertCurrency(num(supplier.amount_due), supplier.currency, displayCurrency);
-    supplierRows.push({ ...supplier, amountDisplay, daysLeft: daysUntil(supplier.due_date) });
+    const balanceNative = num(supplier.current_balance);
+    const revenueNative = num(supplier.forecast_revenue);
+    const cogsPercent = num(supplier.cogs_percent);
+    const bufferPercent = num(supplier.buffer_percent);
+    const expectedCogsNative = revenueNative * (cogsPercent / 100);
+    const bufferNative = expectedCogsNative * (bufferPercent / 100);
+    const requiredReserveNative = expectedCogsNative + bufferNative;
+    const topupNative = Math.max(0, requiredReserveNative - balanceNative);
+    supplierRows.push({
+      ...supplier,
+      balanceDisplay: await convertCurrency(balanceNative, supplier.currency, displayCurrency),
+      forecastRevenueDisplay: await convertCurrency(revenueNative, supplier.currency, displayCurrency),
+      expectedCogsDisplay: await convertCurrency(expectedCogsNative, supplier.currency, displayCurrency),
+      bufferDisplay: await convertCurrency(bufferNative, supplier.currency, displayCurrency),
+      requiredReserveDisplay: await convertCurrency(requiredReserveNative, supplier.currency, displayCurrency),
+      topupDisplay: await convertCurrency(topupNative, supplier.currency, displayCurrency)
+    });
   }
 
   const adRows = [];
-  for (const account of adAccounts) {
-    const currentDisplay = await convertCurrency(num(account.current_balance), account.currency, displayCurrency);
-    const targetDisplay = await convertCurrency(num(account.target_balance), account.currency, displayCurrency);
-    const dailyDisplay = await convertCurrency(num(account.daily_spend), account.currency, displayCurrency);
-    const topupDisplay = Math.max(0, targetDisplay - currentDisplay);
-    const runwayDays = dailyDisplay > 0 ? currentDisplay / dailyDisplay : null;
-    const scaledDailyDisplay = dailyDisplay * (1 + (num(settings.planning?.scale_percent, 20) / 100));
-    const scaledTopupDisplay = Math.max(0, targetDisplay - currentDisplay + Math.max(0, scaledDailyDisplay - dailyDisplay) * num(settings.planning?.scale_buffer_days, 3));
-    adRows.push({ ...account, currentDisplay, targetDisplay, dailyDisplay, topupDisplay, runwayDays, scaledDailyDisplay, scaledTopupDisplay });
+  for (const ad of adAccounts) {
+    const currentNative = num(ad.current_balance);
+    const dailyNative = num(ad.daily_spend);
+    const fundingDays = num(ad.funding_days, cashflowDays);
+    const roasOk = num(ad.roas_3d) >= roasThreshold;
+    const plannedDailyNative = roasOk ? dailyNative * (1 + scalePercent / 100) : dailyNative;
+    const requiredReserveNative = plannedDailyNative * fundingDays;
+    const topupNative = Math.max(0, requiredReserveNative - currentNative);
+    const runwayDays = dailyNative > 0 ? currentNative / dailyNative : null;
+    adRows.push({
+      ...ad,
+      roasOk,
+      runwayDays,
+      plannedDailyDisplay: await convertCurrency(plannedDailyNative, ad.currency, displayCurrency),
+      currentDisplay: await convertCurrency(currentNative, ad.currency, displayCurrency),
+      dailySpendDisplay: await convertCurrency(dailyNative, ad.currency, displayCurrency),
+      requiredReserveDisplay: await convertCurrency(requiredReserveNative, ad.currency, displayCurrency),
+      topupDisplay: await convertCurrency(topupNative, ad.currency, displayCurrency)
+    });
   }
 
-  const bankCash = bankCards.reduce((sum, bank) => sum + bank.balanceDisplay, 0);
-  const pendingIncoming = enrichedPayouts.filter(p => p.status !== 'received').reduce((sum, p) => sum + p.netDisplay, 0);
-  const supplierDue = supplierRows.filter(s => s.status !== 'paid').reduce((sum, s) => sum + s.amountDisplay, 0);
-  const adTopups = adRows.reduce((sum, a) => sum + a.topupDisplay, 0);
-  const opexReserve = await convertCurrency(num(settings.opex?.reserve_amount), settings.opex?.currency || displayCurrency, displayCurrency);
-  const obligations = supplierDue + adTopups + opexReserve;
-  const netPosition = bankCash + pendingIncoming - obligations;
+  const opexRows = [];
+  for (const item of opexItems) {
+    const amountNative = periodAmount(item.amount, item.period, cashflowDays);
+    opexRows.push({ ...item, amountForPeriodDisplay: await convertCurrency(amountNative, item.currency, displayCurrency) });
+  }
 
-  const scaleExtraNeeded = adRows.reduce((sum, a) => sum + Math.max(0, a.scaledTopupDisplay - a.topupDisplay), 0);
-  const netAfterScale = netPosition - scaleExtraNeeded;
-  const ownerTargetDisplay = await convertCurrency(num(settings.owner_draw?.target_amount), settings.owner_draw?.currency || displayCurrency, displayCurrency);
-  const netAfterOwnerDraw = netPosition - ownerTargetDisplay;
+  const bankCash = bankRows.reduce((sum, bank) => sum + bank.balanceDisplay, 0);
+  const pendingIncoming = enrichedPayouts.filter(p => p.status !== 'received').reduce((sum, p) => sum + p.netDisplay, 0);
+  const cashAvailable = bankCash + pendingIncoming;
+  const supplierSend = supplierRows.reduce((sum, row) => sum + row.topupDisplay, 0);
+  const adTopups = adRows.reduce((sum, row) => sum + row.topupDisplay, 0);
+  const opexReserve = opexRows.reduce((sum, row) => sum + row.amountForPeriodDisplay, 0);
+  const requiredSends = supplierSend + adTopups + opexReserve;
+  const cashAfterRequiredSends = cashAvailable - requiredSends;
+  const safeOwnerDraw = Math.max(0, Math.min(ownerDrawTargetDisplay, cashAfterRequiredSends));
+  const remainingAfterOwnerDraw = cashAfterRequiredSends - safeOwnerDraw;
 
   return {
     displayCurrency,
-    bankCards,
+    cashflowDays,
+    bankRows,
     enrichedPayouts,
     supplierRows,
     adRows,
+    opexRows,
     totals: {
       bankCash,
       pendingIncoming,
-      supplierDue,
+      cashAvailable,
+      supplierSend,
       adTopups,
       opexReserve,
-      obligations,
-      netPosition,
-      scaleExtraNeeded,
-      netAfterScale,
-      ownerTargetDisplay,
-      netAfterOwnerDraw
+      requiredSends,
+      cashAfterRequiredSends,
+      ownerDrawTargetDisplay,
+      safeOwnerDraw,
+      remainingAfterOwnerDraw
     }
   };
 }
@@ -135,14 +170,4 @@ export function forecastPayouts(enrichedPayouts, days) {
     const expected = new Date(`${payout.expected_date}T00:00:00`);
     return expected >= today && expected <= end;
   });
-}
-
-export function scaleVerdict({ roas3d, threshold, netAfterScale }) {
-  const roasOk = num(roas3d) >= num(threshold);
-  const cashOk = num(netAfterScale) >= 0;
-
-  if (roasOk && cashOk) return { level: 'good', text: 'Good to scale based on ROAS and cash position.' };
-  if (!roasOk && cashOk) return { level: 'warn', text: 'Cash can support it, but ROAS is not strong enough yet.' };
-  if (roasOk && !cashOk) return { level: 'bad', text: 'ROAS is good, but cash position is too tight.' };
-  return { level: 'bad', text: 'Do not scale yet. ROAS and cash position both need work.' };
 }

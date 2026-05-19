@@ -25,6 +25,34 @@ export function todayPlus(days) {
   return date.toISOString().slice(0, 10);
 }
 
+export function addBusinessDays(startDate, businessDays) {
+  const date = new Date(startDate);
+  date.setHours(0, 0, 0, 0);
+  let remaining = Math.max(1, Math.round(num(businessDays, 5)));
+  while (remaining > 0) {
+    date.setDate(date.getDate() + 1);
+    const day = date.getDay();
+    if (day !== 0 && day !== 6) remaining -= 1;
+  }
+  return date;
+}
+
+export function dateOnly(value) {
+  if (!value) return null;
+  const date = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return null;
+  date.setHours(0, 0, 0, 0);
+  return date;
+}
+
+export function daysBetween(startDate, endDate) {
+  const start = new Date(startDate);
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(endDate);
+  end.setHours(0, 0, 0, 0);
+  return Math.max(1, Math.ceil((end - start) / 86400000));
+}
+
 export async function enrichPayout(payout, displayCurrency) {
   const grossNative = num(payout.gross_amount);
   const payoutConversionFeeNative = grossNative * (num(payout.payout_conversion_fee_percent) / 100);
@@ -45,15 +73,38 @@ export async function enrichPayout(payout, displayCurrency) {
   };
 }
 
+export function getPlanningWindow(enrichedPayouts, settings) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const futureDates = enrichedPayouts
+    .filter(p => p.status !== 'received')
+    .map(p => dateOnly(p.expected_date))
+    .filter(date => date && date >= today)
+    .sort((a, b) => a - b);
+
+  const nextPayoutDate = futureDates[0] || addBusinessDays(today, settings.payout_delay_business_days || 5);
+  const autoCashflowDays = daysBetween(today, nextPayoutDate);
+
+  return {
+    today,
+    nextPayoutDate,
+    nextPayoutDateString: nextPayoutDate.toISOString().slice(0, 10),
+    autoCashflowDays
+  };
+}
+
 export async function calculateDashboard({ banks, payouts, suppliers, adAccounts, opexItems, settings }) {
   const displayCurrency = settings.display_currency || 'USD';
-  const cashflowDays = num(settings.cashflow_days, 7);
   const scalePercent = num(settings.scale_percent, 20);
   const roasThreshold = num(settings.roas_threshold, 1.8);
   const ownerDrawTargetDisplay = await convertCurrency(num(settings.owner_draw_target), settings.owner_draw_currency || displayCurrency, displayCurrency);
 
   const enrichedPayouts = [];
   for (const payout of payouts) enrichedPayouts.push(await enrichPayout(payout, displayCurrency));
+
+  const planningWindow = getPlanningWindow(enrichedPayouts, settings);
+  const cashflowDays = planningWindow.autoCashflowDays;
 
   const bankRows = [];
   for (const bank of banks) {
@@ -64,24 +115,34 @@ export async function calculateDashboard({ banks, payouts, suppliers, adAccounts
     bankRows.push({ ...bank, balanceDisplay, incomingDisplay, projectedDisplay: balanceDisplay + incomingDisplay });
   }
 
+  const forecastPayoutsInWindow = enrichedPayouts.filter(p => {
+    const date = dateOnly(p.expected_date);
+    return p.status !== 'received' && date && date <= planningWindow.nextPayoutDate;
+  });
+  const revenueBaseDisplay = forecastPayoutsInWindow.length
+    ? forecastPayoutsInWindow.reduce((sum, p) => sum + p.grossDisplay, 0)
+    : enrichedPayouts.filter(p => p.status !== 'received').reduce((sum, p) => sum + p.grossDisplay, 0);
+
   const supplierRows = [];
   for (const supplier of suppliers) {
-    const balanceNative = num(supplier.current_balance);
-    const revenueNative = num(supplier.forecast_revenue);
+    const balanceDisplay = await convertCurrency(num(supplier.current_balance), supplier.currency, displayCurrency);
+    const revenueSharePercent = num(supplier.revenue_share_percent, 100);
+    const supplierRevenueBaseDisplay = revenueBaseDisplay * (revenueSharePercent / 100);
     const cogsPercent = num(supplier.cogs_percent);
     const bufferPercent = num(supplier.buffer_percent);
-    const expectedCogsNative = revenueNative * (cogsPercent / 100);
-    const bufferNative = expectedCogsNative * (bufferPercent / 100);
-    const requiredReserveNative = expectedCogsNative + bufferNative;
-    const topupNative = Math.max(0, requiredReserveNative - balanceNative);
+    const expectedCogsDisplay = supplierRevenueBaseDisplay * (cogsPercent / 100);
+    const bufferDisplay = expectedCogsDisplay * (bufferPercent / 100);
+    const requiredReserveDisplay = expectedCogsDisplay + bufferDisplay;
+    const topupDisplay = Math.max(0, requiredReserveDisplay - balanceDisplay);
     supplierRows.push({
       ...supplier,
-      balanceDisplay: await convertCurrency(balanceNative, supplier.currency, displayCurrency),
-      forecastRevenueDisplay: await convertCurrency(revenueNative, supplier.currency, displayCurrency),
-      expectedCogsDisplay: await convertCurrency(expectedCogsNative, supplier.currency, displayCurrency),
-      bufferDisplay: await convertCurrency(bufferNative, supplier.currency, displayCurrency),
-      requiredReserveDisplay: await convertCurrency(requiredReserveNative, supplier.currency, displayCurrency),
-      topupDisplay: await convertCurrency(topupNative, supplier.currency, displayCurrency)
+      revenue_share_percent: revenueSharePercent,
+      balanceDisplay,
+      forecastRevenueDisplay: supplierRevenueBaseDisplay,
+      expectedCogsDisplay,
+      bufferDisplay,
+      requiredReserveDisplay,
+      topupDisplay
     });
   }
 
@@ -89,16 +150,16 @@ export async function calculateDashboard({ banks, payouts, suppliers, adAccounts
   for (const ad of adAccounts) {
     const currentNative = num(ad.current_balance);
     const dailyNative = num(ad.daily_spend);
-    const fundingDays = num(ad.funding_days, cashflowDays);
     const roasOk = num(ad.roas_3d) >= roasThreshold;
     const plannedDailyNative = roasOk ? dailyNative * (1 + scalePercent / 100) : dailyNative;
-    const requiredReserveNative = plannedDailyNative * fundingDays;
+    const requiredReserveNative = plannedDailyNative * cashflowDays;
     const topupNative = Math.max(0, requiredReserveNative - currentNative);
     const runwayDays = dailyNative > 0 ? currentNative / dailyNative : null;
     adRows.push({
       ...ad,
       roasOk,
       runwayDays,
+      funding_days: cashflowDays,
       plannedDailyDisplay: await convertCurrency(plannedDailyNative, ad.currency, displayCurrency),
       currentDisplay: await convertCurrency(currentNative, ad.currency, displayCurrency),
       dailySpendDisplay: await convertCurrency(dailyNative, ad.currency, displayCurrency),
@@ -107,17 +168,15 @@ export async function calculateDashboard({ banks, payouts, suppliers, adAccounts
     });
   }
 
-  const forecastRevenueTotalDisplay = supplierRows.reduce((sum, row) => sum + row.forecastRevenueDisplay, 0);
-
   const opexRows = [];
   for (const item of opexItems) {
     const percent = num(item.amount);
-    const amountForPeriodDisplay = forecastRevenueTotalDisplay * (percent / 100);
+    const amountForPeriodDisplay = revenueBaseDisplay * (percent / 100);
     opexRows.push({
       ...item,
       calculation_mode: 'percent_of_revenue',
       amountForPeriodDisplay,
-      subLabel: `${percent.toFixed(2)}% of forecast revenue`
+      subLabel: `${percent.toFixed(2)}% of payout revenue base`
     });
   }
 
@@ -136,6 +195,7 @@ export async function calculateDashboard({ banks, payouts, suppliers, adAccounts
   return {
     displayCurrency,
     cashflowDays,
+    planningWindow,
     bankRows,
     enrichedPayouts,
     supplierRows,
@@ -151,7 +211,7 @@ export async function calculateDashboard({ banks, payouts, suppliers, adAccounts
       opexPercentTotal,
       requiredSends,
       cashAfterRequiredSends,
-      forecastRevenueTotalDisplay,
+      forecastRevenueTotalDisplay: revenueBaseDisplay,
       ownerDrawTargetDisplay,
       safeOwnerDraw,
       remainingAfterOwnerDraw

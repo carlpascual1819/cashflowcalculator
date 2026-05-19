@@ -94,6 +94,107 @@ export function getPlanningWindow(enrichedPayouts, settings) {
   };
 }
 
+function payoutsWithinWindow(enrichedPayouts, today, days) {
+  const end = new Date(today);
+  end.setDate(end.getDate() + num(days, 7));
+  return enrichedPayouts.filter(payout => {
+    if (payout.status === 'received' || !payout.expected_date) return false;
+    const expected = dateOnly(payout.expected_date);
+    return expected && expected >= today && expected <= end;
+  });
+}
+
+function buildWindowTotals({ days, today, enrichedPayouts, bankCash, adRows, supplierInputs, opexRows, ownerDrawTargetDisplay }) {
+  const payoutRows = payoutsWithinWindow(enrichedPayouts, today, days);
+  const pendingIncoming = payoutRows.reduce((sum, p) => sum + p.netDisplay, 0);
+  const cashAvailable = bankCash + pendingIncoming;
+
+  const projectedAdSpendDaily = adRows.reduce((sum, row) => sum + row.dailySpendDisplay, 0);
+  const projectedAdSpendTotal = projectedAdSpendDaily * days;
+  const forecastRevenueDailyDisplay = adRows.reduce((sum, row) => sum + row.dailyRevenueDisplay, 0);
+  const forecastRevenueTotalDisplay = forecastRevenueDailyDisplay * days;
+
+  const adTopups = adRows.reduce((sum, row) => sum + Math.max(0, row.dailySpendDisplay * days - row.currentDisplay), 0);
+  const scaleExtraNeeded = adRows.reduce((sum, row) => row.roasOk ? sum + (row.dailySpendDisplay * row.scalePercentDecimal * days) : sum, 0);
+
+  let expectedCogsTotal = 0;
+  let supplierSend = 0;
+  const supplierRows = supplierInputs.map(supplier => {
+    const supplierRevenueBaseDisplay = forecastRevenueTotalDisplay * (supplier.revenueSharePercent / 100);
+    const expectedCogsDisplay = supplierRevenueBaseDisplay * (supplier.cogsPercent / 100);
+    const expectedCogsDailyDisplay = days > 0 ? expectedCogsDisplay / days : expectedCogsDisplay;
+    const bufferDisplay = expectedCogsDisplay * (supplier.bufferPercent / 100);
+    const requiredReserveDisplay = expectedCogsDisplay + bufferDisplay;
+    const topupDisplay = Math.max(0, requiredReserveDisplay - supplier.balanceDisplay);
+    expectedCogsTotal += expectedCogsDisplay;
+    supplierSend += topupDisplay;
+    return {
+      ...supplier.raw,
+      revenue_share_percent: supplier.revenueSharePercent,
+      balanceDisplay: supplier.balanceDisplay,
+      forecastRevenueDisplay: supplierRevenueBaseDisplay,
+      expectedCogsDisplay,
+      expectedCogsDailyDisplay,
+      bufferDisplay,
+      requiredReserveDisplay,
+      topupDisplay
+    };
+  });
+
+  const opexReserve = opexRows.reduce((sum, row) => sum + (forecastRevenueTotalDisplay * (num(row.amount) / 100)), 0);
+  const opexDaily = days > 0 ? opexReserve / days : opexReserve;
+  const requiredSends = supplierSend + adTopups + opexReserve;
+  const cashAfterRequiredSends = cashAvailable - requiredSends;
+  const theoreticalOwnerDraw = Math.max(0, cashAfterRequiredSends);
+  const safeOwnerDraw = Math.max(0, Math.min(ownerDrawTargetDisplay, cashAfterRequiredSends));
+  const remainingAfterOwnerDraw = cashAfterRequiredSends - safeOwnerDraw;
+
+  const opexRowsForWindow = opexRows.map(row => {
+    const amountForPeriodDisplay = forecastRevenueTotalDisplay * (num(row.amount) / 100);
+    return {
+      ...row,
+      amountForPeriodDisplay,
+      amountDailyDisplay: days > 0 ? amountForPeriodDisplay / days : amountForPeriodDisplay,
+      subLabel: `${num(row.amount).toFixed(2)}% of projected revenue`
+    };
+  });
+
+  const adRowsForWindow = adRows.map(row => ({
+    ...row,
+    funding_days: days,
+    plannedSpendDisplay: row.dailySpendDisplay * days,
+    projectedRevenueDisplay: row.dailyRevenueDisplay * days,
+    topupDisplay: Math.max(0, row.dailySpendDisplay * days - row.currentDisplay),
+    scaleExtraDisplay: row.roasOk ? row.dailySpendDisplay * row.scalePercentDecimal * days : 0
+  }));
+
+  return {
+    days,
+    payoutRows,
+    pendingIncoming,
+    cashAvailable,
+    supplierRows,
+    adRows: adRowsForWindow,
+    opexRows: opexRowsForWindow,
+    projectedAdSpendDaily,
+    projectedAdSpendTotal,
+    forecastRevenueDailyDisplay,
+    forecastRevenueTotalDisplay,
+    expectedCogsDaily: days > 0 ? expectedCogsTotal / days : expectedCogsTotal,
+    expectedCogsTotal,
+    supplierSend,
+    adTopups,
+    opexReserve,
+    opexDaily,
+    requiredSends,
+    scaleExtraNeeded,
+    cashAfterRequiredSends,
+    theoreticalOwnerDraw,
+    safeOwnerDraw,
+    remainingAfterOwnerDraw
+  };
+}
+
 export async function calculateDashboard({ banks, payouts, suppliers, adAccounts, opexItems, settings }) {
   const displayCurrency = settings.display_currency || 'USD';
   const scalePercent = num(settings.scale_percent, 20);
@@ -104,7 +205,9 @@ export async function calculateDashboard({ banks, payouts, suppliers, adAccounts
   for (const payout of payouts) enrichedPayouts.push(await enrichPayout(payout, displayCurrency));
 
   const planningWindow = getPlanningWindow(enrichedPayouts, settings);
-  const cashflowDays = planningWindow.autoCashflowDays;
+  const selectedDays = settings.projection_days === 'auto'
+    ? planningWindow.autoCashflowDays
+    : Math.max(1, Math.round(num(settings.projection_days, 7)));
 
   const bankRows = [];
   for (const bank of banks) {
@@ -114,138 +217,120 @@ export async function calculateDashboard({ banks, payouts, suppliers, adAccounts
       .reduce((sum, p) => sum + p.netDisplay, 0);
     bankRows.push({ ...bank, balanceDisplay, incomingDisplay, projectedDisplay: balanceDisplay + incomingDisplay });
   }
+  const bankCash = bankRows.reduce((sum, bank) => sum + bank.balanceDisplay, 0);
 
-  const adRows = [];
+  const adRowsBase = [];
   for (const ad of adAccounts) {
     const currentNative = num(ad.current_balance);
     const dailyNative = num(ad.daily_spend);
     const roas = num(ad.roas_3d);
     const currentDisplay = await convertCurrency(currentNative, ad.currency, displayCurrency);
     const dailySpendDisplay = await convertCurrency(dailyNative, ad.currency, displayCurrency);
-    const plannedSpendDisplay = dailySpendDisplay * cashflowDays;
-    const topupDisplay = Math.max(0, plannedSpendDisplay - currentDisplay);
-    const runwayDays = dailyNative > 0 ? currentNative / dailyNative : null;
     const dailyRevenueDisplay = dailySpendDisplay * roas;
-    const projectedRevenueDisplay = dailyRevenueDisplay * cashflowDays;
-    const scaleExtraDisplay = roas >= roasThreshold ? dailySpendDisplay * (scalePercent / 100) * cashflowDays : 0;
-    const scaledSpendDisplay = plannedSpendDisplay + scaleExtraDisplay;
-    const scaledRevenueDisplay = roas >= roasThreshold ? projectedRevenueDisplay * (1 + scalePercent / 100) : projectedRevenueDisplay;
+    const runwayDays = dailyNative > 0 ? currentNative / dailyNative : null;
 
-    adRows.push({
+    adRowsBase.push({
       ...ad,
       roas,
       roasOk: roas >= roasThreshold,
-      runwayDays,
-      funding_days: cashflowDays,
+      scalePercentDecimal: scalePercent / 100,
       currentDisplay,
       dailySpendDisplay,
-      plannedSpendDisplay,
-      topupDisplay,
       dailyRevenueDisplay,
-      projectedRevenueDisplay,
-      scaleExtraDisplay,
-      scaledSpendDisplay,
-      scaledRevenueDisplay
+      runwayDays
     });
   }
 
-  const projectedAdSpendDaily = adRows.reduce((sum, row) => sum + row.dailySpendDisplay, 0);
-  const projectedAdSpendTotal = adRows.reduce((sum, row) => sum + row.plannedSpendDisplay, 0);
-  const projectedRevenueDaily = adRows.reduce((sum, row) => sum + row.dailyRevenueDisplay, 0);
-  const projectedRevenueTotalFromAds = adRows.reduce((sum, row) => sum + row.projectedRevenueDisplay, 0);
-  const scaleExtraNeeded = adRows.reduce((sum, row) => sum + row.scaleExtraDisplay, 0);
-
-  const payoutGrossTotal = enrichedPayouts.filter(p => p.status !== 'received').reduce((sum, p) => sum + p.grossDisplay, 0);
-  const revenueBaseDisplay = projectedRevenueTotalFromAds > 0 ? projectedRevenueTotalFromAds : payoutGrossTotal;
-  const revenueBasis = projectedRevenueTotalFromAds > 0 ? 'ad projection' : 'pending payout gross fallback';
-
-  const supplierRows = [];
+  const supplierInputs = [];
   for (const supplier of suppliers) {
-    const balanceDisplay = await convertCurrency(num(supplier.current_balance), supplier.currency, displayCurrency);
-    const revenueSharePercent = num(supplier.revenue_share_percent, 100);
-    const supplierRevenueBaseDisplay = revenueBaseDisplay * (revenueSharePercent / 100);
-    const cogsPercent = num(supplier.cogs_percent);
-    const bufferPercent = num(supplier.buffer_percent);
-    const expectedCogsDisplay = supplierRevenueBaseDisplay * (cogsPercent / 100);
-    const expectedCogsDailyDisplay = cashflowDays > 0 ? expectedCogsDisplay / cashflowDays : expectedCogsDisplay;
-    const bufferDisplay = expectedCogsDisplay * (bufferPercent / 100);
-    const requiredReserveDisplay = expectedCogsDisplay + bufferDisplay;
-    const topupDisplay = Math.max(0, requiredReserveDisplay - balanceDisplay);
-    supplierRows.push({
-      ...supplier,
-      revenue_share_percent: revenueSharePercent,
-      balanceDisplay,
-      forecastRevenueDisplay: supplierRevenueBaseDisplay,
-      expectedCogsDisplay,
-      expectedCogsDailyDisplay,
-      bufferDisplay,
-      requiredReserveDisplay,
-      topupDisplay
+    supplierInputs.push({
+      raw: supplier,
+      balanceDisplay: await convertCurrency(num(supplier.current_balance), supplier.currency, displayCurrency),
+      revenueSharePercent: num(supplier.revenue_share_percent, 100),
+      cogsPercent: num(supplier.cogs_percent),
+      bufferPercent: num(supplier.buffer_percent)
     });
   }
 
-  const expectedCogsTotal = supplierRows.reduce((sum, row) => sum + row.expectedCogsDisplay, 0);
-  const expectedCogsDaily = cashflowDays > 0 ? expectedCogsTotal / cashflowDays : expectedCogsTotal;
+  const opexRowsBase = (opexItems || []).map(item => ({
+    ...item,
+    calculation_mode: 'percent_of_revenue',
+    amount: num(item.amount)
+  }));
 
-  const opexRows = [];
-  for (const item of opexItems) {
-    const percent = num(item.amount);
-    const amountForPeriodDisplay = revenueBaseDisplay * (percent / 100);
-    const amountDailyDisplay = cashflowDays > 0 ? amountForPeriodDisplay / cashflowDays : amountForPeriodDisplay;
-    opexRows.push({
-      ...item,
-      calculation_mode: 'percent_of_revenue',
-      amountForPeriodDisplay,
-      amountDailyDisplay,
-      subLabel: `${percent.toFixed(2)}% of projected revenue`
+  const selected = buildWindowTotals({
+    days: selectedDays,
+    today: planningWindow.today,
+    enrichedPayouts,
+    bankCash,
+    adRows: adRowsBase,
+    supplierInputs,
+    opexRows: opexRowsBase,
+    ownerDrawTargetDisplay
+  });
+
+  const opexPercentTotal = opexRowsBase.reduce((sum, row) => sum + num(row.amount), 0);
+  const scenarioDays = Array.from(new Set([7, 14, 30, planningWindow.autoCashflowDays])).sort((a, b) => a - b);
+  const scenarioRows = scenarioDays.map(days => {
+    const row = buildWindowTotals({
+      days,
+      today: planningWindow.today,
+      enrichedPayouts,
+      bankCash,
+      adRows: adRowsBase,
+      supplierInputs,
+      opexRows: opexRowsBase,
+      ownerDrawTargetDisplay
     });
-  }
+    return {
+      days,
+      cashAvailable: row.cashAvailable,
+      revenue: row.forecastRevenueTotalDisplay,
+      supplierSend: row.supplierSend,
+      adTopups: row.adTopups,
+      opexReserve: row.opexReserve,
+      requiredSends: row.requiredSends,
+      theoreticalOwnerDraw: row.theoreticalOwnerDraw,
+      remainingAfterTargetDraw: row.cashAfterRequiredSends - Math.min(ownerDrawTargetDisplay, Math.max(0, row.cashAfterRequiredSends))
+    };
+  });
 
-  const bankCash = bankRows.reduce((sum, bank) => sum + bank.balanceDisplay, 0);
-  const pendingIncoming = enrichedPayouts.filter(p => p.status !== 'received').reduce((sum, p) => sum + p.netDisplay, 0);
-  const cashAvailable = bankCash + pendingIncoming;
-  const supplierSend = supplierRows.reduce((sum, row) => sum + row.topupDisplay, 0);
-  const adTopups = adRows.reduce((sum, row) => sum + row.topupDisplay, 0);
-  const opexReserve = opexRows.reduce((sum, row) => sum + row.amountForPeriodDisplay, 0);
-  const opexDaily = cashflowDays > 0 ? opexReserve / cashflowDays : opexReserve;
-  const opexPercentTotal = opexRows.reduce((sum, row) => sum + num(row.amount), 0);
-  const requiredSends = supplierSend + adTopups + opexReserve;
-  const cashAfterRequiredSends = cashAvailable - requiredSends;
-  const safeOwnerDraw = Math.max(0, Math.min(ownerDrawTargetDisplay, cashAfterRequiredSends));
-  const remainingAfterOwnerDraw = cashAfterRequiredSends - safeOwnerDraw;
+  const allPendingIncoming = enrichedPayouts.filter(p => p.status !== 'received').reduce((sum, p) => sum + p.netDisplay, 0);
 
   return {
     displayCurrency,
-    cashflowDays,
+    cashflowDays: selectedDays,
     planningWindow,
     bankRows,
     enrichedPayouts,
-    supplierRows,
-    adRows,
-    opexRows,
+    supplierRows: selected.supplierRows,
+    adRows: selected.adRows,
+    opexRows: selected.opexRows,
+    scenarioRows,
     totals: {
       bankCash,
-      pendingIncoming,
-      cashAvailable,
-      supplierSend,
-      adTopups,
-      opexReserve,
-      opexDaily,
+      pendingIncoming: selected.pendingIncoming,
+      pendingIncomingAll: allPendingIncoming,
+      cashAvailable: selected.cashAvailable,
+      supplierSend: selected.supplierSend,
+      adTopups: selected.adTopups,
+      opexReserve: selected.opexReserve,
+      opexDaily: selected.opexDaily,
       opexPercentTotal,
-      requiredSends,
-      cashAfterRequiredSends,
-      forecastRevenueTotalDisplay: revenueBaseDisplay,
-      forecastRevenueDailyDisplay: projectedRevenueDaily,
-      forecastRevenueBasis: revenueBasis,
-      projectedAdSpendDaily,
-      projectedAdSpendTotal,
-      projectedRevenueTotalFromAds,
-      expectedCogsDaily,
-      expectedCogsTotal,
-      scaleExtraNeeded,
+      requiredSends: selected.requiredSends,
+      cashAfterRequiredSends: selected.cashAfterRequiredSends,
+      forecastRevenueTotalDisplay: selected.forecastRevenueTotalDisplay,
+      forecastRevenueDailyDisplay: selected.forecastRevenueDailyDisplay,
+      forecastRevenueBasis: 'ad projection',
+      projectedAdSpendDaily: selected.projectedAdSpendDaily,
+      projectedAdSpendTotal: selected.projectedAdSpendTotal,
+      expectedCogsDaily: selected.expectedCogsDaily,
+      expectedCogsTotal: selected.expectedCogsTotal,
+      scaleExtraNeeded: selected.scaleExtraNeeded,
       ownerDrawTargetDisplay,
-      safeOwnerDraw,
-      remainingAfterOwnerDraw
+      theoreticalOwnerDraw: selected.theoreticalOwnerDraw,
+      safeOwnerDraw: selected.safeOwnerDraw,
+      remainingAfterOwnerDraw: selected.remainingAfterOwnerDraw
     }
   };
 }

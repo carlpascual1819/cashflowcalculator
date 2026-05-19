@@ -1,6 +1,6 @@
 {
-  "name": "cashflow-calculator-v7",
-  "version": "7.0.0",
+  "name": "cashflow-calculator-v8",
+  "version": "8.0.0",
   "private": true,
   "type": "module",
   "scripts": {

@@ -5,7 +5,7 @@ import { hasSupabase, supabase } from './lib/supabase';
 import { CURRENCIES, calculateDashboard, fmt, forecastPayouts, num, todayPlus, uid } from './lib/calc';
 import './styles.css';
 
-const LOCAL_KEY = 'cashflow_calculator_v7';
+const LOCAL_KEY = 'cashflow_calculator_v8';
 
 const seed = {
   banks: [{ id: 'bank-1', name: 'AW', currency: 'USD', balance: 0 }],
@@ -31,6 +31,7 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [activeTab, setActiveTab] = useState('snapshot');
   const [forecastDays, setForecastDays] = useState(7);
+  const [projectionDays, setProjectionDays] = useState(7);
   const [expandedPayout, setExpandedPayout] = useState(seed.payouts[0].id);
 
   const [banks, setBanks] = useState(seed.banks);
@@ -57,17 +58,17 @@ function App() {
 
   useEffect(() => {
     let live = true;
-    calculateDashboard({ banks, payouts, suppliers, adAccounts, opexItems, settings })
+    calculateDashboard({ banks, payouts, suppliers, adAccounts, opexItems, settings: { ...settings, projection_days: projectionDays } })
       .then(result => { if (live) setDashboard(result); })
       .catch(err => setMessage(err.message));
     return () => { live = false; };
-  }, [banks, payouts, suppliers, adAccounts, opexItems, settings]);
+  }, [banks, payouts, suppliers, adAccounts, opexItems, settings, projectionDays]);
 
   useEffect(() => {
     if (!hasSupabase) {
       localStorage.setItem(LOCAL_KEY, JSON.stringify({ banks, payouts, suppliers, adAccounts, opexItems, settings }));
     }
-  }, [banks, payouts, suppliers, adAccounts, opexItems, settings]);
+  }, [banks, payouts, suppliers, adAccounts, opexItems, settings, projectionDays]);
 
   function loadLocal() {
     try {
@@ -186,8 +187,8 @@ function App() {
     <div className="app-shell">
       <header className="topbar">
         <div>
-          <div className="eyebrow">Cashflow Calculator v7</div>
-          <h1>Projects revenue from ad spend and ROAS, then calculates supplier sends, ad top-ups, OPEX %, and safe owner draw.</h1>
+          <div className="eyebrow">Cashflow Calculator v8</div>
+          <h1>Calculates supplier send, ad top-up, OPEX reserve, and theoretical owner draw for 7, 14, 30, or auto days.</h1>
         </div>
         <div className="top-actions">
           <button className="ghost" onClick={hasSupabase ? loadRemote : loadLocal}><RefreshCcw size={16} /> Reload</button>
@@ -208,21 +209,24 @@ function App() {
         <main>
           <section className="summary-grid">
             <Summary title="Bank Cash" value={fmt(dashboard.totals.bankCash, dashboard.displayCurrency)} icon={<Landmark />} />
-            <Summary title="Pending Incoming" value={fmt(dashboard.totals.pendingIncoming, dashboard.displayCurrency)} icon={<Wallet />} />
+            <Summary title="Payouts In Window" value={fmt(dashboard.totals.pendingIncoming, dashboard.displayCurrency)} icon={<Wallet />} />
             <Summary title="Cash Available" value={fmt(dashboard.totals.cashAvailable, dashboard.displayCurrency)} icon={<Banknote />} tone="good" />
             <Summary title="Required Sends" value={fmt(dashboard.totals.requiredSends, dashboard.displayCurrency)} icon={<CreditCard />} tone="warn" />
           </section>
 
           <section className="decision-grid">
             <Panel title="Cash Decision">
-              <Metric label="Projected cash available" value={fmt(dashboard.totals.cashAvailable, dashboard.displayCurrency)} />
+              <div className="segmented projection-picker">
+                {[7, 14, 30].map(days => <button key={days} className={projectionDays === days ? 'active' : ''} onClick={() => setProjectionDays(days)}>{days} days</button>)}
+                <button className={projectionDays === 'auto' ? 'active' : ''} onClick={() => setProjectionDays('auto')}>Auto to payout</button>
+              </div>
+              <Metric label="Projection window" value={`${dashboard.cashflowDays} days`} />
               <Metric label="Next payout date" value={dashboard.planningWindow.nextPayoutDateString} />
-              <Metric label="Auto coverage days" value={`${dashboard.cashflowDays} days`} />
+              <Metric label="Payouts landing in window" value={fmt(dashboard.totals.pendingIncoming, dashboard.displayCurrency)} />
               <Metric label="Projected ad spend / day" value={fmt(dashboard.totals.projectedAdSpendDaily, dashboard.displayCurrency)} />
               <Metric label="Projected ad spend for window" value={fmt(dashboard.totals.projectedAdSpendTotal, dashboard.displayCurrency)} />
               <Metric label="Projected revenue / day" value={fmt(dashboard.totals.forecastRevenueDailyDisplay, dashboard.displayCurrency)} />
               <Metric label="Projected revenue for window" value={fmt(dashboard.totals.forecastRevenueTotalDisplay, dashboard.displayCurrency)} />
-              <Metric label="Revenue basis" value={dashboard.totals.forecastRevenueBasis} />
               <Metric label="Expected COGS / day" value={fmt(dashboard.totals.expectedCogsDaily, dashboard.displayCurrency)} />
               <Metric label="Expected COGS for window" value={fmt(dashboard.totals.expectedCogsTotal, dashboard.displayCurrency)} />
               <Metric label="Send to supplier" value={fmt(dashboard.totals.supplierSend, dashboard.displayCurrency)} />
@@ -231,14 +235,16 @@ function App() {
               <Metric label="Total OPEX %" value={`${num(dashboard.totals.opexPercentTotal).toFixed(2)}%`} />
               <Metric label="Extra cash to scale qualified ads" value={fmt(dashboard.totals.scaleExtraNeeded, dashboard.displayCurrency)} />
               <Metric label="Cash after required sends" value={fmt(dashboard.totals.cashAfterRequiredSends, dashboard.displayCurrency)} />
+              <Metric label="Theoretical max owner draw" value={fmt(dashboard.totals.theoreticalOwnerDraw, dashboard.displayCurrency)} />
               <div className={`verdict ${dashboard.totals.cashAfterRequiredSends >= 0 ? 'good' : 'bad'}`}>
-                {dashboard.totals.cashAfterRequiredSends >= 0 ? 'Cash covers supplier, ads, and OPEX.' : 'Cash is short before owner draw.'}
+                {dashboard.totals.cashAfterRequiredSends >= 0 ? 'Cash covers supplier, ads, and OPEX for this window.' : 'Cash is short before owner draw for this window.'}
               </div>
             </Panel>
 
             <Panel title="Owner Draw">
               <Metric label="Target owner draw" value={fmt(dashboard.totals.ownerDrawTargetDisplay, dashboard.displayCurrency)} />
               <Metric label="Safe owner draw now" value={fmt(dashboard.totals.safeOwnerDraw, dashboard.displayCurrency)} />
+              <Metric label="Theoretical max draw" value={fmt(dashboard.totals.theoreticalOwnerDraw, dashboard.displayCurrency)} />
               <Metric label="Remaining business cash" value={fmt(dashboard.totals.remainingAfterOwnerDraw, dashboard.displayCurrency)} />
               <div className={`verdict ${dashboard.totals.safeOwnerDraw >= dashboard.totals.ownerDrawTargetDisplay ? 'good' : 'warn'}`}>
                 {dashboard.totals.safeOwnerDraw >= dashboard.totals.ownerDrawTargetDisplay ? 'Target draw is safe.' : 'Take less or wait for more cash.'}
@@ -296,7 +302,18 @@ function App() {
         <main>
           <section className="panel wide">
             <div className="panel-head">
-              <h2>Forecasted Payouts</h2>
+              <h2>Projection Scenarios</h2>
+            </div>
+            <div className="forecast-total">This is the actual answer: how much cash is needed and how much can be taken for each window.</div>
+            <div className="table scenario-table">
+              <div className="table-head scenario-row"><span>Days</span><span>Revenue</span><span>Supplier</span><span>Ads</span><span>OPEX</span><span>Required</span><span>Max Draw</span></div>
+              {dashboard.scenarioRows.map(row => <div className="table-row scenario-row" key={row.days}><span>{row.days}</span><span>{fmt(row.revenue, dashboard.displayCurrency)}</span><span>{fmt(row.supplierSend, dashboard.displayCurrency)}</span><span>{fmt(row.adTopups, dashboard.displayCurrency)}</span><span>{fmt(row.opexReserve, dashboard.displayCurrency)}</span><span>{fmt(row.requiredSends, dashboard.displayCurrency)}</span><span>{fmt(row.theoreticalOwnerDraw, dashboard.displayCurrency)}</span></div>)}
+            </div>
+          </section>
+
+          <section className="panel wide">
+            <div className="panel-head">
+              <h2>Payouts Landing</h2>
               <div className="segmented">{[7, 14, 30].map(days => <button key={days} className={forecastDays === days ? 'active' : ''} onClick={() => setForecastDays(days)}>{days}d</button>)}</div>
             </div>
             <div className="forecast-total">Expected landed cash: {fmt(forecastIncoming, dashboard.displayCurrency)}</div>

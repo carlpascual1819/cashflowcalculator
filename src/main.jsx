@@ -5,7 +5,7 @@ import { hasSupabase, supabase } from './lib/supabase';
 import { CURRENCIES, calculateDashboard, fmt, forecastPayouts, num, todayPlus, uid } from './lib/calc';
 import './styles.css';
 
-const LOCAL_KEY = 'cashflow_calculator_v6';
+const LOCAL_KEY = 'cashflow_calculator_v7';
 
 const seed = {
   banks: [{ id: 'bank-1', name: 'AW', currency: 'USD', balance: 0 }],
@@ -186,8 +186,8 @@ function App() {
     <div className="app-shell">
       <header className="topbar">
         <div>
-          <div className="eyebrow">Cashflow Calculator v6</div>
-          <h1>Uses payout timing to calculate supplier sends, ad top-ups, OPEX %, and safe owner draw.</h1>
+          <div className="eyebrow">Cashflow Calculator v7</div>
+          <h1>Projects revenue from ad spend and ROAS, then calculates supplier sends, ad top-ups, OPEX %, and safe owner draw.</h1>
         </div>
         <div className="top-actions">
           <button className="ghost" onClick={hasSupabase ? loadRemote : loadLocal}><RefreshCcw size={16} /> Reload</button>
@@ -218,11 +218,18 @@ function App() {
               <Metric label="Projected cash available" value={fmt(dashboard.totals.cashAvailable, dashboard.displayCurrency)} />
               <Metric label="Next payout date" value={dashboard.planningWindow.nextPayoutDateString} />
               <Metric label="Auto coverage days" value={`${dashboard.cashflowDays} days`} />
+              <Metric label="Projected ad spend / day" value={fmt(dashboard.totals.projectedAdSpendDaily, dashboard.displayCurrency)} />
+              <Metric label="Projected ad spend for window" value={fmt(dashboard.totals.projectedAdSpendTotal, dashboard.displayCurrency)} />
+              <Metric label="Projected revenue / day" value={fmt(dashboard.totals.forecastRevenueDailyDisplay, dashboard.displayCurrency)} />
+              <Metric label="Projected revenue for window" value={fmt(dashboard.totals.forecastRevenueTotalDisplay, dashboard.displayCurrency)} />
+              <Metric label="Revenue basis" value={dashboard.totals.forecastRevenueBasis} />
+              <Metric label="Expected COGS / day" value={fmt(dashboard.totals.expectedCogsDaily, dashboard.displayCurrency)} />
+              <Metric label="Expected COGS for window" value={fmt(dashboard.totals.expectedCogsTotal, dashboard.displayCurrency)} />
               <Metric label="Send to supplier" value={fmt(dashboard.totals.supplierSend, dashboard.displayCurrency)} />
               <Metric label="Top up ad accounts" value={fmt(dashboard.totals.adTopups, dashboard.displayCurrency)} />
               <Metric label="Reserve for OPEX" value={fmt(dashboard.totals.opexReserve, dashboard.displayCurrency)} />
               <Metric label="Total OPEX %" value={`${num(dashboard.totals.opexPercentTotal).toFixed(2)}%`} />
-              <Metric label="Forecast revenue base" value={fmt(dashboard.totals.forecastRevenueTotalDisplay, dashboard.displayCurrency)} />
+              <Metric label="Extra cash to scale qualified ads" value={fmt(dashboard.totals.scaleExtraNeeded, dashboard.displayCurrency)} />
               <Metric label="Cash after required sends" value={fmt(dashboard.totals.cashAfterRequiredSends, dashboard.displayCurrency)} />
               <div className={`verdict ${dashboard.totals.cashAfterRequiredSends >= 0 ? 'good' : 'bad'}`}>
                 {dashboard.totals.cashAfterRequiredSends >= 0 ? 'Cash covers supplier, ads, and OPEX.' : 'Cash is short before owner draw.'}
@@ -241,10 +248,10 @@ function App() {
 
           <section className="three-col">
             <Panel title="Supplier Send Needed">
-              {dashboard.supplierRows.map(s => <MiniRow key={s.id} title={s.name} value={fmt(s.topupDisplay, dashboard.displayCurrency)} sub={`COGS ${num(s.cogs_percent).toFixed(1)}% | Balance ${fmt(s.balanceDisplay, dashboard.displayCurrency)}`} tone={s.topupDisplay > 0 ? 'bad' : 'good'} />)}
+              {dashboard.supplierRows.map(s => <MiniRow key={s.id} title={s.name} value={fmt(s.topupDisplay, dashboard.displayCurrency)} sub={`COGS ${num(s.cogs_percent).toFixed(1)}% | ${fmt(s.expectedCogsDailyDisplay, dashboard.displayCurrency)}/day | Balance ${fmt(s.balanceDisplay, dashboard.displayCurrency)}`} tone={s.topupDisplay > 0 ? 'bad' : 'good'} />)}
             </Panel>
             <Panel title="Ad Top-up Needed">
-              {dashboard.adRows.map(a => <MiniRow key={a.id} title={a.name} value={fmt(a.topupDisplay, dashboard.displayCurrency)} sub={`${dashboard.cashflowDays} auto coverage days | Runway ${a.runwayDays === null ? 'n/a' : a.runwayDays.toFixed(1)} days | ROAS ${num(a.roas_3d).toFixed(2)}x`} tone={a.topupDisplay > 0 ? 'bad' : 'good'} />)}
+              {dashboard.adRows.map(a => <MiniRow key={a.id} title={a.name} value={fmt(a.topupDisplay, dashboard.displayCurrency)} sub={`${fmt(a.dailySpendDisplay, dashboard.displayCurrency)}/day spend | ${fmt(a.dailyRevenueDisplay, dashboard.displayCurrency)}/day revenue | Runway ${a.runwayDays === null ? 'n/a' : a.runwayDays.toFixed(1)} days`} tone={a.topupDisplay > 0 ? 'bad' : 'good'} />)}
             </Panel>
             <Panel title="OPEX Reserve Needed">
               {dashboard.opexRows.map(o => <MiniRow key={o.id} title={o.name} value={fmt(o.amountForPeriodDisplay, dashboard.displayCurrency)} sub={o.subLabel} />)}
@@ -306,7 +313,7 @@ function App() {
         <main className="settings-grid compact">
           <SettingsPanel title="Global Settings">
             <Field label="Display currency" type="select" value={settings.display_currency} onChange={v => saveSettings({ ...settings, display_currency: v })} options={CURRENCIES} />
-            <Field label="Payout delay, business days" value={settings.payout_delay_business_days} onChange={v => saveSettings({ ...settings, payout_delay_business_days: v })} />
+            <Field label="Fallback payout delay, business days" value={settings.payout_delay_business_days} onChange={v => saveSettings({ ...settings, payout_delay_business_days: v })} />
             <Field label="Scale percent" value={settings.scale_percent} onChange={v => saveSettings({ ...settings, scale_percent: v })} />
             <Field label="ROAS threshold" value={settings.roas_threshold} onChange={v => saveSettings({ ...settings, roas_threshold: v })} />
             <Field label="Owner draw target" value={settings.owner_draw_target} onChange={v => saveSettings({ ...settings, owner_draw_target: v })} />

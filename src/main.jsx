@@ -2,10 +2,10 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Banknote, CalendarDays, CreditCard, Database, Landmark, LogOut, Plus, RefreshCcw, Settings, Trash2, Wallet } from 'lucide-react';
 import { hasSupabase, supabase } from './lib/supabase';
-import { CURRENCIES, PERIODS, calculateDashboard, fmt, forecastPayouts, num, todayPlus, uid } from './lib/calc';
+import { CURRENCIES, calculateDashboard, fmt, forecastPayouts, num, todayPlus, uid } from './lib/calc';
 import './styles.css';
 
-const LOCAL_KEY = 'cashflow_calculator_v2';
+const LOCAL_KEY = 'cashflow_calculator_v4';
 
 const seed = {
   banks: [{ id: 'bank-1', name: 'AW', currency: 'USD', balance: 0 }],
@@ -14,7 +14,11 @@ const seed = {
   ],
   suppliers: [{ id: 'supplier-1', name: 'NSDL', currency: 'USD', current_balance: 0, forecast_revenue: 0, cogs_percent: 22, buffer_percent: 10 }],
   adAccounts: [{ id: 'ad-1', name: 'Ad1', platform: 'Meta', currency: 'USD', current_balance: 0, daily_spend: 0, funding_days: 3, roas_3d: 0 }],
-  opexItems: [{ id: 'opex-1', name: 'Payroll', currency: 'USD', amount: 0, period: 'monthly' }],
+  opexItems: [
+    { id: 'opex-1', name: 'Payroll', amount: 0 },
+    { id: 'opex-2', name: 'Subscriptions', amount: 0 },
+    { id: 'opex-3', name: 'Misc', amount: 0 }
+  ],
   settings: { display_currency: 'USD', cashflow_days: 7, scale_percent: 20, roas_threshold: 1.8, owner_draw_target: 500, owner_draw_currency: 'USD' }
 };
 
@@ -182,8 +186,8 @@ function App() {
     <div className="app-shell">
       <header className="topbar">
         <div>
-          <div className="eyebrow">Cashflow Calculator v2</div>
-          <h1>Calculates supplier sends, ad top-ups, OPEX reserve, and safe owner draw.</h1>
+          <div className="eyebrow">Cashflow Calculator v4</div>
+          <h1>Calculates supplier sends, ad top-ups, OPEX by percentage, and safe owner draw.</h1>
         </div>
         <div className="top-actions">
           <button className="ghost" onClick={hasSupabase ? loadRemote : loadLocal}><RefreshCcw size={16} /> Reload</button>
@@ -215,6 +219,8 @@ function App() {
               <Metric label="Send to supplier" value={fmt(dashboard.totals.supplierSend, dashboard.displayCurrency)} />
               <Metric label="Top up ad accounts" value={fmt(dashboard.totals.adTopups, dashboard.displayCurrency)} />
               <Metric label="Reserve for OPEX" value={fmt(dashboard.totals.opexReserve, dashboard.displayCurrency)} />
+              <Metric label="Total OPEX %" value={`${num(dashboard.totals.opexPercentTotal).toFixed(2)}%`} />
+              <Metric label="Forecast revenue base" value={fmt(dashboard.totals.forecastRevenueTotalDisplay, dashboard.displayCurrency)} />
               <Metric label="Cash after required sends" value={fmt(dashboard.totals.cashAfterRequiredSends, dashboard.displayCurrency)} />
               <div className={`verdict ${dashboard.totals.cashAfterRequiredSends >= 0 ? 'good' : 'bad'}`}>
                 {dashboard.totals.cashAfterRequiredSends >= 0 ? 'Cash covers supplier, ads, and OPEX.' : 'Cash is short before owner draw.'}
@@ -239,7 +245,7 @@ function App() {
               {dashboard.adRows.map(a => <MiniRow key={a.id} title={a.name} value={fmt(a.topupDisplay, dashboard.displayCurrency)} sub={`${a.funding_days} days funded | Runway ${a.runwayDays === null ? 'n/a' : a.runwayDays.toFixed(1)} days | ROAS ${num(a.roas_3d).toFixed(2)}x`} tone={a.topupDisplay > 0 ? 'bad' : 'good'} />)}
             </Panel>
             <Panel title="OPEX Reserve Needed">
-              {dashboard.opexRows.map(o => <MiniRow key={o.id} title={o.name} value={fmt(o.amountForPeriodDisplay, dashboard.displayCurrency)} sub={`${o.period} over ${dashboard.cashflowDays} days`} />)}
+              {dashboard.opexRows.map(o => <MiniRow key={o.id} title={o.name} value={fmt(o.amountForPeriodDisplay, dashboard.displayCurrency)} sub={o.subLabel} />)}
             </Panel>
           </section>
         </main>
@@ -271,7 +277,7 @@ function App() {
             {adAccounts.map(account => <EditableAdAccount key={account.id} account={account} update={patch => updateRow('ad_accounts', account.id, patch, setAdAccounts)} remove={() => deleteRow('ad_accounts', account.id, setAdAccounts)} />)}
           </SettingsPanel>
 
-          <SettingsPanel title="OPEX Items" action={<AddButton onClick={() => insertRow('opex_items', { id: uid('opex'), name: 'New Expense', currency: settings.display_currency, amount: 0, period: 'monthly' }, setOpexItems)} />}>
+          <SettingsPanel title="OPEX Percentages" action={<AddButton onClick={() => insertRow('opex_items', { id: uid('opex'), name: 'New OPEX Bucket', amount: 0, currency: settings.display_currency, period: 'one_time', calculation_mode: 'percent_of_revenue' }, setOpexItems)} />}>
             {opexItems.map(item => <EditableOpex key={item.id} item={item} update={patch => updateRow('opex_items', item.id, patch, setOpexItems)} remove={() => deleteRow('opex_items', item.id, setOpexItems)} />)}
           </SettingsPanel>
         </main>
@@ -333,6 +339,12 @@ function PayoutEditor({ payout, banks, update, remove, displayCurrency }) {
 function EditableBank({ bank, update, remove }) { return <div className="edit-card"><TextField label="Name" value={bank.name} onChange={v => update({ name: v })} /><Field label="Currency" type="select" value={bank.currency} onChange={v => update({ currency: v })} options={CURRENCIES} /><Field label="Current bank balance" value={bank.balance} onChange={v => update({ balance: v })} /><button className="danger" onClick={remove}><Trash2 size={15} /> Delete</button></div>; }
 function EditableSupplier({ supplier, update, remove }) { return <div className="edit-card"><TextField label="Supplier name" value={supplier.name} onChange={v => update({ name: v })} /><Field label="Currency" type="select" value={supplier.currency} onChange={v => update({ currency: v })} options={CURRENCIES} /><Field label="Current supplier balance" value={supplier.current_balance} onChange={v => update({ current_balance: v })} /><Field label="Forecast revenue" value={supplier.forecast_revenue} onChange={v => update({ forecast_revenue: v })} /><Field label="COGS %" value={supplier.cogs_percent} onChange={v => update({ cogs_percent: v })} /><Field label="Buffer %" value={supplier.buffer_percent} onChange={v => update({ buffer_percent: v })} /><button className="danger" onClick={remove}><Trash2 size={15} /> Delete</button></div>; }
 function EditableAdAccount({ account, update, remove }) { return <div className="edit-card"><TextField label="Name" value={account.name} onChange={v => update({ name: v })} /><Field label="Currency" type="select" value={account.currency} onChange={v => update({ currency: v })} options={CURRENCIES} /><Field label="Current balance" value={account.current_balance} onChange={v => update({ current_balance: v })} /><Field label="Daily spend" value={account.daily_spend} onChange={v => update({ daily_spend: v })} /><Field label="Days to fund" value={account.funding_days} onChange={v => update({ funding_days: v })} /><Field label="3D ROAS" value={account.roas_3d} onChange={v => update({ roas_3d: v })} /><button className="danger" onClick={remove}><Trash2 size={15} /> Delete</button></div>; }
-function EditableOpex({ item, update, remove }) { return <div className="edit-card"><TextField label="Expense name" value={item.name} onChange={v => update({ name: v })} /><Field label="Currency" type="select" value={item.currency} onChange={v => update({ currency: v })} options={CURRENCIES} /><Field label="Amount" value={item.amount} onChange={v => update({ amount: v })} /><Field label="Period" type="select" value={item.period} onChange={v => update({ period: v })} options={PERIODS} /><button className="danger" onClick={remove}><Trash2 size={15} /> Delete</button></div>; }
+function EditableOpex({ item, update, remove }) {
+  return <div className="edit-card">
+    <TextField label="OPEX bucket" value={item.name} onChange={v => update({ name: v })} />
+    <Field label="OPEX % of forecast revenue" value={item.amount} onChange={v => update({ amount: v, calculation_mode: 'percent_of_revenue' })} />
+    <button className="danger" onClick={remove}><Trash2 size={15} /> Delete</button>
+  </div>;
+}
 
 createRoot(document.getElementById('root')).render(<App />);

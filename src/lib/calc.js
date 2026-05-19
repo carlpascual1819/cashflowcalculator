@@ -1,7 +1,6 @@
 import { convertCurrency } from './fx';
 
 export const CURRENCIES = ['USD', 'EUR', 'GBP', 'HKD', 'CAD', 'AUD', 'CHF', 'SEK', 'NOK', 'DKK', 'MXN', 'ILS', 'JPY', 'PHP'];
-export const PERIODS = ['one_time', 'daily', 'weekly', 'monthly', 'yearly'];
 
 export function num(value, fallback = 0) {
   const parsed = Number(value);
@@ -24,16 +23,6 @@ export function todayPlus(days) {
   const date = new Date();
   date.setDate(date.getDate() + days);
   return date.toISOString().slice(0, 10);
-}
-
-export function periodAmount(amount, period, days) {
-  const value = num(amount);
-  const d = num(days, 7);
-  if (period === 'daily') return value * d;
-  if (period === 'weekly') return value * (d / 7);
-  if (period === 'monthly') return value * (d / 30);
-  if (period === 'yearly') return value * (d / 365);
-  return value;
 }
 
 export async function enrichPayout(payout, displayCurrency) {
@@ -118,10 +107,18 @@ export async function calculateDashboard({ banks, payouts, suppliers, adAccounts
     });
   }
 
+  const forecastRevenueTotalDisplay = supplierRows.reduce((sum, row) => sum + row.forecastRevenueDisplay, 0);
+
   const opexRows = [];
   for (const item of opexItems) {
-    const amountNative = periodAmount(item.amount, item.period, cashflowDays);
-    opexRows.push({ ...item, amountForPeriodDisplay: await convertCurrency(amountNative, item.currency, displayCurrency) });
+    const percent = num(item.amount);
+    const amountForPeriodDisplay = forecastRevenueTotalDisplay * (percent / 100);
+    opexRows.push({
+      ...item,
+      calculation_mode: 'percent_of_revenue',
+      amountForPeriodDisplay,
+      subLabel: `${percent.toFixed(2)}% of forecast revenue`
+    });
   }
 
   const bankCash = bankRows.reduce((sum, bank) => sum + bank.balanceDisplay, 0);
@@ -130,6 +127,7 @@ export async function calculateDashboard({ banks, payouts, suppliers, adAccounts
   const supplierSend = supplierRows.reduce((sum, row) => sum + row.topupDisplay, 0);
   const adTopups = adRows.reduce((sum, row) => sum + row.topupDisplay, 0);
   const opexReserve = opexRows.reduce((sum, row) => sum + row.amountForPeriodDisplay, 0);
+  const opexPercentTotal = opexRows.reduce((sum, row) => sum + num(row.amount), 0);
   const requiredSends = supplierSend + adTopups + opexReserve;
   const cashAfterRequiredSends = cashAvailable - requiredSends;
   const safeOwnerDraw = Math.max(0, Math.min(ownerDrawTargetDisplay, cashAfterRequiredSends));
@@ -150,8 +148,10 @@ export async function calculateDashboard({ banks, payouts, suppliers, adAccounts
       supplierSend,
       adTopups,
       opexReserve,
+      opexPercentTotal,
       requiredSends,
       cashAfterRequiredSends,
+      forecastRevenueTotalDisplay,
       ownerDrawTargetDisplay,
       safeOwnerDraw,
       remainingAfterOwnerDraw
